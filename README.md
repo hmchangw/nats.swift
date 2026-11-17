@@ -151,6 +151,22 @@ Notice that the subject `foo.>` uses a special wildcard syntax, allowing for sub
 to a hierarchy of subjects. For more detailed information, please refer to the [NATS documentation
 on _Subject-Based Messaging_](https://docs.nats.io/nats-concepts/subjects).
 
+### Choosing the Network Transport
+
+On iOS and macOS the client connects through Network.framework (via
+`NIOTransportServices`) by default. Connections are made by hostname, so the system
+applies per-domain VPN, split-tunnel and on-demand rules the same way it does for
+`URLSession`. To use plain BSD sockets instead (the behavior of earlier versions):
+
+```swift
+let nats = NatsClientOptions()
+    .url(URL(string: "wss://example.com:443/nats")!)
+    .transport(.posixSockets)
+    .build()
+```
+
+On Linux only `.posixSockets` is available and the option is ignored.
+
 ### Setting Log Levels
 
 The default log level is `.info`. You can set it to see more or less verbose messages. Possible values are `.debug`, `.info`, `.error` or `.critical`.
