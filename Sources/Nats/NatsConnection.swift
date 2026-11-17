@@ -100,7 +100,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         set { _reconnectTask.withLockedValue { $0 = newValue } }
     }
 
-    private let group: MultiThreadedEventLoopGroup
+    private let transportFactory: TransportFactory
 
     private let serverInfoContinuation = NIOLockedValueBox<CheckedContinuation<ServerInfo, Error>?>(
         nil)
@@ -120,10 +120,11 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         retainServersOrder: Bool,
         pingInterval: TimeInterval, auth: Auth?, requireTls: Bool, tlsFirst: Bool,
         clientCertificate: URL?, clientKey: URL?,
-        rootCertificate: URL?, retryOnFailedConnect: Bool
+        rootCertificate: URL?, retryOnFailedConnect: Bool,
+        transport: NatsTransport
     ) {
         self._urls = NIOLockedValueBox(urls)
-        self.group = .singleton
+        self.transportFactory = TransportFactory(transport)
         self._inputBuffer = NIOLockedValueBox(allocator.buffer(capacity: 1024))
         self.reconnectWait = UInt64(reconnectWait * 1_000_000_000)
         self.maxReconnects = maxReconnects
@@ -635,15 +636,11 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
 
     private func bootstrapConnection(
         to server: URL
-    ) -> (ClientBootstrap, EventLoopPromise<Void>) {
-        let upgradePromise: EventLoopPromise<Void> = self.group.any().makePromise(of: Void.self)
-        let bootstrap = ClientBootstrap(group: self.group)
-            .channelOption(
-                ChannelOptions.socket(
-                    SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR),
-                value: 1
-            )
-            .channelInitializer { channel in
+    ) -> (TransportBootstrap, EventLoopPromise<Void>) {
+        let group = self.transportFactory.group
+        let upgradePromise: EventLoopPromise<Void> = group.any().makePromise(of: Void.self)
+        let bootstrap = self.transportFactory
+            .makeBootstrap(connectTimeout: .seconds(5)) { channel in
                 if self.requireTls && self.tlsFirst {
                     upgradePromise.succeed(())
                     do {
@@ -753,7 +750,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
                     }
                     return channel.eventLoop.makeSucceededFuture(())
                 }
-            }.connectTimeout(.seconds(5))
+            }
         return (bootstrap, upgradePromise)
     }
 

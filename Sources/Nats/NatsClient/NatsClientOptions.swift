@@ -31,6 +31,7 @@ public class NatsClientOptions {
     private var clientCertificate: URL? = nil
     private var clientKey: URL? = nil
     private var inboxPrefix: String = "_INBOX."
+    private var transport: NatsTransport = .default
 
     public init() {}
 
@@ -180,6 +181,19 @@ public class NatsClientOptions {
         return self
     }
 
+    /// Selects the network transport used to open connections.
+    ///
+    /// On Apple platforms the default is ``NatsTransport/networkFramework``, which connects
+    /// through Network.framework by hostname. This lets iOS apply per-domain VPN rules
+    /// (e.g. split tunneling) the same way it does for `URLSession`. Use
+    /// ``NatsTransport/posixSockets`` to restore the previous BSD-socket behavior.
+    /// On other platforms only ``NatsTransport/posixSockets`` is available and this option
+    /// is ignored.
+    public func transport(_ transport: NatsTransport) -> NatsClientOptions {
+        self.transport = transport
+        return self
+    }
+
     public func build() -> NatsClient {
         let client = NatsClient()
         client.inboxPrefix = inboxPrefix
@@ -195,7 +209,8 @@ public class NatsClientOptions {
             clientCertificate: clientCertificate,
             clientKey: clientKey,
             rootCertificate: rootCertificate,
-            retryOnFailedConnect: initialReconnect
+            retryOnFailedConnect: initialReconnect,
+            transport: transport
         )
         return client
     }
