@@ -44,65 +44,88 @@ public enum NatsTransport: Sendable {
 /// Creates the event loop group and connection bootstraps for a transport.
 internal struct TransportFactory: Sendable {
     let group: EventLoopGroup
+    /// The transport in use: `.posixSockets` where Network.framework is unavailable.
+    private let transport: NatsTransport
 
     init(_ transport: NatsTransport) {
         #if canImport(Network)
             if transport == .networkFramework {
                 self.group = NIOTSEventLoopGroup.singleton
+                self.transport = .networkFramework
                 return
             }
         #endif
         self.group = MultiThreadedEventLoopGroup.singleton
+        self.transport = .posixSockets
     }
 
-    /// Whether connections go through Network.framework. Derived from `group` so the two
-    /// can never disagree.
-    var usesNetworkFramework: Bool {
+    /// A bootstrap for one connection attempt. `channelInitializer` sets up the NATS pipeline;
+    /// transport-specific handlers are added in front of it.
+    func makeBootstrap(
+        connectTimeout: TimeAmount,
+        channelInitializer: @escaping @Sendable (Channel) -> EventLoopFuture<Void>
+    ) -> TransportBootstrap {
         #if canImport(Network)
-            return group is NIOTSEventLoopGroup
-        #else
-            return false
-        #endif
-    }
-
-    /// A bootstrap with transport-specific options applied. The caller adds the
-    /// channel initializer and connect timeout.
-    func makeBootstrap() -> NIOClientTCPBootstrap {
-        #if canImport(Network)
-            if usesNetworkFramework {
+            if transport == .networkFramework {
                 logger.debug("connecting via Network.framework (NIOTransportServices)")
                 // waitForActivity stays at its default (true): Network.framework may need a
                 // moment for the path to become viable, e.g. while an on-demand VPN comes up.
                 // ConnectivityWaitHandler fails fast on errors that waiting cannot fix, and
                 // the connect timeout bounds the wait otherwise.
-                let bootstrap = NIOTSConnectionBootstrap(group: group)
-                return NIOClientTCPBootstrap(bootstrap, tls: NIOInsecureNoTLS())
+                let attempt = ConnectAttempt()
+                let bootstrap = NIOClientTCPBootstrap(
+                    NIOTSConnectionBootstrap(group: group), tls: NIOInsecureNoTLS())
+                return TransportBootstrap(
+                    bootstrap: bootstrap, connectTimeout: connectTimeout, attempt: attempt
+                ) { channel in
+                    do {
+                        try channel.pipeline.syncOperations.addHandler(
+                            ConnectivityWaitHandler(attempt: attempt))
+                    } catch {
+                        return channel.eventLoop.makeFailedFuture(error)
+                    }
+                    return channelInitializer(channel)
+                }
             }
         #endif
         logger.debug("connecting via POSIX sockets")
-        let bootstrap = ClientBootstrap(group: group)
-            .channelOption(
-                ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR),
-                value: 1
-            )
-        return NIOClientTCPBootstrap(bootstrap, tls: NIOInsecureNoTLS())
-    }
-
-    /// Adds transport-specific handlers to a new channel. Must be called from the channel
-    /// initializer, on the channel's event loop, before any other handler is added.
-    func prepare(_ channel: Channel, for attempt: ConnectAttempt) throws {
-        #if canImport(Network)
-            if usesNetworkFramework {
-                try channel.pipeline.syncOperations.addHandler(
-                    ConnectivityWaitHandler(attempt: attempt))
-            }
-        #endif
+        let bootstrap = NIOClientTCPBootstrap(
+            ClientBootstrap(group: group), tls: NIOInsecureNoTLS())
+        return TransportBootstrap(
+            bootstrap: bootstrap, connectTimeout: connectTimeout, attempt: nil,
+            channelInitializer: channelInitializer)
     }
 }
 
-/// State for a single connection attempt, shared between the channel pipeline and the
-/// code awaiting the connect.
-internal final class ConnectAttempt: Sendable {
+/// A configured bootstrap for one connection attempt.
+internal struct TransportBootstrap {
+    private let bootstrap: NIOClientTCPBootstrap
+    private let attempt: ConnectAttempt?
+
+    fileprivate init(
+        bootstrap: NIOClientTCPBootstrap, connectTimeout: TimeAmount, attempt: ConnectAttempt?,
+        channelInitializer: @escaping @Sendable (Channel) -> EventLoopFuture<Void>
+    ) {
+        self.bootstrap =
+            bootstrap
+            .channelConvenienceOptions([.allowLocalEndpointReuse])
+            .connectTimeout(connectTimeout)
+            .channelInitializer(channelInitializer)
+        self.attempt = attempt
+    }
+
+    /// Connects to the server. Transport-specific failures are reported as
+    /// ``NatsError/ConnectError``.
+    func connect(host: String, port: Int) -> EventLoopFuture<Channel> {
+        bootstrap.connect(host: host, port: port).flatMapErrorThrowing { [attempt] error in
+            throw connectError(for: attempt?.failure(for: error) ?? error)
+        }
+    }
+}
+
+/// State for a single Network.framework connection attempt, shared between the channel
+/// pipeline and the connect future.
+private final class ConnectAttempt: Sendable {
     /// The last reason Network.framework gave for not being able to connect yet.
     private let waitingError = NIOLockedValueBox<Error?>(nil)
 
@@ -119,18 +142,18 @@ internal final class ConnectAttempt: Sendable {
     }
 }
 
-/// Maps transport-specific connect errors onto ``NatsError/ConnectError``.
-/// Returns nil for errors the caller should classify itself.
-internal func transportConnectError(_ error: Error) -> NatsError.ConnectError? {
+/// Maps Network.framework errors onto ``NatsError/ConnectError``; other errors are returned
+/// unchanged for the caller to classify.
+private func connectError(for error: Error) -> Error {
     #if canImport(Network)
         if let error = error as? NWError {
             if case .dns = error {
-                return .dns(error)
+                return NatsError.ConnectError.dns(error)
             }
-            return .io(error)
+            return NatsError.ConnectError.io(error)
         }
     #endif
-    return nil
+    return error
 }
 
 #if canImport(Network)
@@ -141,7 +164,7 @@ internal func transportConnectError(_ error: Error) -> NatsError.ConnectError? {
     /// server failover are not slowed down by the connect timeout. Other errors, such as no
     /// viable network path, keep waiting until the connect timeout. The handler removes
     /// itself once the connection is active.
-    final class ConnectivityWaitHandler: ChannelInboundHandler, RemovableChannelHandler {
+    private final class ConnectivityWaitHandler: ChannelInboundHandler, RemovableChannelHandler {
         typealias InboundIn = ByteBuffer
 
         private let attempt: ConnectAttempt
@@ -163,9 +186,8 @@ internal func transportConnectError(_ error: Error) -> NatsError.ConnectError? {
                     logger.debug("connect failed: \(error)")
                     context.close(promise: nil)
                     return
-                } else {
-                    logger.debug("waiting for connectivity: \(error)")
                 }
+                logger.debug("waiting for connectivity: \(error)")
             }
             context.fireUserInboundEventTriggered(event)
         }

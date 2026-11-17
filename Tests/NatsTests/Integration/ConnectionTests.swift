@@ -60,12 +60,18 @@ class CoreNatsTests: XCTestCase {
         ("testSubscribePermissionsRevoked", testSubscribePermissionsRevoked),
         ("testUnsubscribeAfterWithWaitingConsumer", testUnsubscribeAfterWithWaitingConsumer),
         ("testQueueGroupSurvivesReconnect", testQueueGroupSurvivesReconnect),
-        ("testPubSubWithEachTransport", testPubSubWithEachTransport),
-        ("testConnectErrorsWithEachTransport", testConnectErrorsWithEachTransport),
-        ("testTlsWithEachTransport", testTlsWithEachTransport),
-        ("testWebsocketWithEachTransport", testWebsocketWithEachTransport),
     ]
     var natsServer = NatsServer()
+
+    /// Every transport the platform supports, so the POSIX path is covered on Apple platforms
+    /// as well as the Network.framework default.
+    let transports: [NatsTransport] = {
+        #if canImport(Network)
+            return [.networkFramework, .posixSockets]
+        #else
+            return [.posixSockets]
+        #endif
+    }()
 
     override func tearDown() {
         super.tearDown()
@@ -240,33 +246,40 @@ class CoreNatsTests: XCTestCase {
 
     func testConnectDNSError() async throws {
         logger.logLevel = .critical
-        let client = NatsClientOptions()
-            .urls([URL(string: "nats://invalid:1234")!])
-            .build()
-        do {
-            try await client.connect()
-        } catch NatsError.ConnectError.dns(_) {
-            return
-        } catch {
-            XCTFail("Expeted dns lookup error; got: \(error)")
+        for transport in transports {
+            let client = NatsClientOptions()
+                .urls([URL(string: "nats://invalid:1234")!])
+                .transport(transport)
+                .build()
+            do {
+                try await client.connect()
+                XCTFail("Expeted dns lookup error (\(transport))")
+            } catch NatsError.ConnectError.dns(_) {
+            } catch {
+                XCTFail("Expeted dns lookup error (\(transport)); got: \(error)")
+            }
         }
-        XCTFail("Expeted dns lookup error")
     }
 
     func testConnectNIOError() async throws {
         logger.logLevel = .critical
-        let client = NatsClientOptions()
-            .urls([URL(string: "nats://localhost:4321")!])
-            .build()
-        do {
-            // should be connection refused error
-            try await client.connect()
-        } catch NatsError.ConnectError.io(_) {
-            return
-        } catch {
-            XCTFail("Expeted IO lookup error; got: \(error)")
+        for transport in transports {
+            let client = NatsClientOptions()
+                .urls([URL(string: "nats://localhost:4321")!])
+                .transport(transport)
+                .build()
+            let start = Date()
+            do {
+                // should be connection refused error
+                try await client.connect()
+                XCTFail("Expeted io lookup error (\(transport))")
+            } catch NatsError.ConnectError.io(_) {
+            } catch {
+                XCTFail("Expeted IO lookup error (\(transport)); got: \(error)")
+            }
+            // Refused connections fail right away, without waiting for the connect timeout.
+            XCTAssertLessThan(Date().timeIntervalSince(start), 4, "transport: \(transport)")
         }
-        XCTFail("Expeted io lookup error")
     }
 
     func testRetryOnFailedConnect() async throws {
@@ -338,13 +351,19 @@ class CoreNatsTests: XCTestCase {
     func testSubscribe() async throws {
         natsServer.start()
         logger.logLevel = .critical
-        let client = NatsClientOptions().url(URL(string: natsServer.clientURL)!).build()
-        try await client.connect()
-        let sub = try await client.subscribe(subject: "test")
-        try await client.publish("msg".data(using: .utf8)!, subject: "test")
-        let iter = sub.makeAsyncIterator()
-        let message = try await iter.next()
-        XCTAssertEqual(message?.payload, "msg".data(using: .utf8)!)
+        for transport in transports {
+            let client = NatsClientOptions()
+                .url(URL(string: natsServer.clientURL)!)
+                .transport(transport)
+                .build()
+            try await client.connect()
+            let sub = try await client.subscribe(subject: "test")
+            try await client.publish("msg".data(using: .utf8)!, subject: "test")
+            let iter = sub.makeAsyncIterator()
+            let message = try await iter.next()
+            XCTAssertEqual(message?.payload, "msg".data(using: .utf8)!, "transport: \(transport)")
+            try await client.close()
+        }
     }
 
     func testQueueGroupSubscribe() async throws {
@@ -740,20 +759,23 @@ class CoreNatsTests: XCTestCase {
         let clientCert = bundle.url(forResource: "client-cert", withExtension: "pem")!
         let clientKey = bundle.url(forResource: "client-key", withExtension: "pem")!
 
-        let client = NatsClientOptions()
-            .url(URL(string: natsServer.clientURL)!)
-            .requireTls()
-            .rootCertificates(certsURL)
-            .clientCertificate(
-                clientCert,
-                clientKey
-            )
-            .build()
-        try await client.connect()
-        try await client.publish("msg".data(using: .utf8)!, subject: "test")
-        try await client.flush()
-        _ = try await client.subscribe(subject: "test")
-        XCTAssertNotNil(client, "Client should not be nil")
+        for transport in transports {
+            let client = NatsClientOptions()
+                .url(URL(string: natsServer.clientURL)!)
+                .requireTls()
+                .rootCertificates(certsURL)
+                .clientCertificate(
+                    clientCert,
+                    clientKey
+                )
+                .transport(transport)
+                .build()
+            try await client.connect()
+            try await client.publish("msg".data(using: .utf8)!, subject: "test")
+            try await client.flush()
+            _ = try await client.subscribe(subject: "test")
+            try await client.close()
+        }
     }
 
     func testTlsFirst() async throws {
@@ -771,21 +793,24 @@ class CoreNatsTests: XCTestCase {
         let clientCert = bundle.url(forResource: "client-cert", withExtension: "pem")!
         let clientKey = bundle.url(forResource: "client-key", withExtension: "pem")!
 
-        let client = NatsClientOptions()
-            .url(URL(string: natsServer.clientURL)!)
-            .requireTls()
-            .rootCertificates(certsURL)
-            .clientCertificate(
-                clientCert,
-                clientKey
-            )
-            .withTlsFirst()
-            .build()
-        try await client.connect()
-        try await client.publish("msg".data(using: .utf8)!, subject: "test")
-        try await client.flush()
-        _ = try await client.subscribe(subject: "test")
-        XCTAssertNotNil(client, "Client should not be nil")
+        for transport in transports {
+            let client = NatsClientOptions()
+                .url(URL(string: natsServer.clientURL)!)
+                .requireTls()
+                .rootCertificates(certsURL)
+                .clientCertificate(
+                    clientCert,
+                    clientKey
+                )
+                .withTlsFirst()
+                .transport(transport)
+                .build()
+            try await client.connect()
+            try await client.publish("msg".data(using: .utf8)!, subject: "test")
+            try await client.flush()
+            _ = try await client.subscribe(subject: "test")
+            try await client.close()
+        }
     }
 
     func testInvalidCertificate() async throws {
@@ -827,16 +852,21 @@ class CoreNatsTests: XCTestCase {
         let bundle = Bundle.module
         natsServer.start(cfg: bundle.url(forResource: "ws", withExtension: "conf")!.relativePath)
 
-        let client = NatsClientOptions().url(URL(string: natsServer.clientWebsocketURL)!).build()
+        for transport in transports {
+            let client = NatsClientOptions()
+                .url(URL(string: natsServer.clientWebsocketURL)!)
+                .transport(transport)
+                .build()
 
-        try await client.connect()
-        let sub = try await client.subscribe(subject: "test")
-        try await client.publish("msg".data(using: .utf8)!, subject: "test")
-        let iter = sub.makeAsyncIterator()
-        let message = try await iter.next()
-        XCTAssertEqual(message?.payload, "msg".data(using: .utf8)!)
+            try await client.connect()
+            let sub = try await client.subscribe(subject: "test")
+            try await client.publish("msg".data(using: .utf8)!, subject: "test")
+            let iter = sub.makeAsyncIterator()
+            let message = try await iter.next()
+            XCTAssertEqual(message?.payload, "msg".data(using: .utf8)!, "transport: \(transport)")
 
-        try await client.close()
+            try await client.close()
+        }
     }
 
     func testWebsocketTLS() async throws {
@@ -1340,123 +1370,6 @@ class CoreNatsTests: XCTestCase {
         }
 
         try await client.close()
-    }
-
-    // MARK: - Transports
-
-    /// Every transport, so the POSIX path is covered on Apple platforms as well.
-    /// On Linux `.networkFramework` falls back to POSIX sockets.
-    private let allTransports: [NatsTransport] = [.posixSockets, .networkFramework]
-
-    func testPubSubWithEachTransport() async throws {
-        natsServer.start()
-        logger.logLevel = .critical
-        for transport in allTransports {
-            let client = NatsClientOptions()
-                .url(URL(string: natsServer.clientURL)!)
-                .transport(transport)
-                .build()
-            try await client.connect()
-            let sub = try await client.subscribe(subject: "test")
-            try await client.publish("msg".data(using: .utf8)!, subject: "test")
-            let message = try await sub.makeAsyncIterator().next()
-            XCTAssertEqual(message?.payload, "msg".data(using: .utf8)!, "transport: \(transport)")
-            try await client.close()
-        }
-    }
-
-    func testConnectErrorsWithEachTransport() async throws {
-        logger.logLevel = .critical
-        for transport in allTransports {
-            let dnsClient = NatsClientOptions()
-                .url(URL(string: "nats://invalid:1234")!)
-                .transport(transport)
-                .build()
-            do {
-                try await dnsClient.connect()
-                XCTFail("\(transport): expected dns error")
-            } catch NatsError.ConnectError.dns(_) {
-            } catch {
-                XCTFail("\(transport): expected dns error; got: \(error)")
-            }
-
-            // A refused connection fails right away instead of waiting for the connect
-            // timeout (5 seconds).
-            let start = Date()
-            let refusedClient = NatsClientOptions()
-                .url(URL(string: "nats://localhost:4321")!)
-                .transport(transport)
-                .build()
-            do {
-                try await refusedClient.connect()
-                XCTFail("\(transport): expected io error")
-            } catch NatsError.ConnectError.io(_) {
-            } catch {
-                XCTFail("\(transport): expected io error; got: \(error)")
-            }
-            XCTAssertLessThan(
-                Date().timeIntervalSince(start), 4, "\(transport): refused connect waited")
-        }
-    }
-
-    func testTlsWithEachTransport() async throws {
-        let bundle = Bundle.module
-        logger.logLevel = .critical
-        let serverCert = bundle.url(forResource: "server-cert", withExtension: "pem")!.relativePath
-        let serverKey = bundle.url(forResource: "server-key", withExtension: "pem")!.relativePath
-        let rootCA = bundle.url(forResource: "rootCA", withExtension: "pem")!.relativePath
-        let certsURL = bundle.url(forResource: "rootCA", withExtension: "pem")!
-        let clientCert = bundle.url(forResource: "client-cert", withExtension: "pem")!
-        let clientKey = bundle.url(forResource: "client-key", withExtension: "pem")!
-
-        // "tls" upgrades after the server's INFO; "tls_first" starts with the handshake.
-        for config in ["tls", "tls_first"] {
-            let cfgFile = try createConfigFileFromTemplate(
-                templateURL: bundle.url(forResource: config, withExtension: "conf")!,
-                args: [serverCert, serverKey, rootCA])
-            let server = NatsServer()
-            server.start(cfg: cfgFile.relativePath)
-            defer { server.stop() }
-
-            for transport in allTransports {
-                var options = NatsClientOptions()
-                    .url(URL(string: server.clientURL)!)
-                    .requireTls()
-                    .rootCertificates(certsURL)
-                    .clientCertificate(clientCert, clientKey)
-                    .transport(transport)
-                if config == "tls_first" {
-                    options = options.withTlsFirst()
-                }
-                let client = options.build()
-                try await client.connect()
-                let sub = try await client.subscribe(subject: "test")
-                try await client.publish("msg".data(using: .utf8)!, subject: "test")
-                let message = try await sub.makeAsyncIterator().next()
-                XCTAssertEqual(
-                    message?.payload, "msg".data(using: .utf8)!, "\(config), \(transport)")
-                try await client.close()
-            }
-        }
-    }
-
-    func testWebsocketWithEachTransport() async throws {
-        logger.logLevel = .critical
-        let bundle = Bundle.module
-        natsServer.start(cfg: bundle.url(forResource: "ws", withExtension: "conf")!.relativePath)
-
-        for transport in allTransports {
-            let client = NatsClientOptions()
-                .url(URL(string: natsServer.clientWebsocketURL)!)
-                .transport(transport)
-                .build()
-            try await client.connect()
-            let sub = try await client.subscribe(subject: "test")
-            try await client.publish("msg".data(using: .utf8)!, subject: "test")
-            let message = try await sub.makeAsyncIterator().next()
-            XCTAssertEqual(message?.payload, "msg".data(using: .utf8)!, "transport: \(transport)")
-            try await client.close()
-        }
     }
 
     func createConfigFileFromTemplate(

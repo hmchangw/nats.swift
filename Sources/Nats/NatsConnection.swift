@@ -101,7 +101,6 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
     }
 
     private let transportFactory: TransportFactory
-    private var group: EventLoopGroup { transportFactory.group }
 
     private let serverInfoContinuation = NIOLockedValueBox<CheckedContinuation<ServerInfo, Error>?>(
         nil)
@@ -373,9 +372,6 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
         }
         if let lastErr {
             self.state.withLockedValue { $0 = .disconnected }
-            if let err = transportConnectError(lastErr) {
-                throw err
-            }
             switch lastErr {
             case let error as ChannelError:
                 serverInfoContinuation.withLockedValue { $0 = nil }
@@ -434,8 +430,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
             infoTask = Task {
                 await withTaskCancellationHandler {
                     do {
-                        let (bootstrap, upgradePromise, attempt) = self.bootstrapConnection(
-                            to: s)
+                        let (bootstrap, upgradePromise) = self.bootstrapConnection(to: s)
 
                         guard let host = s.host, let port = s.port else {
                             upgradePromise.succeed()  // avoid promise leaks
@@ -444,11 +439,7 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
 
                         let connect = bootstrap.connect(host: host, port: port)
                         connect.cascadeFailure(to: upgradePromise)
-                        do {
-                            self.channel = try await connect.get()
-                        } catch {
-                            throw attempt.failure(for: error)
-                        }
+                        self.channel = try await connect.get()
 
                         guard let channel = self.channel else {
                             upgradePromise.succeed()  // avoid promise leaks
@@ -645,16 +636,11 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
 
     private func bootstrapConnection(
         to server: URL
-    ) -> (NIOClientTCPBootstrap, EventLoopPromise<Void>, ConnectAttempt) {
-        let upgradePromise: EventLoopPromise<Void> = self.group.any().makePromise(of: Void.self)
-        let attempt = ConnectAttempt()
-        let bootstrap = self.transportFactory.makeBootstrap()
-            .channelInitializer { channel in
-                do {
-                    try self.transportFactory.prepare(channel, for: attempt)
-                } catch {
-                    return channel.eventLoop.makeFailedFuture(error)
-                }
+    ) -> (TransportBootstrap, EventLoopPromise<Void>) {
+        let group = self.transportFactory.group
+        let upgradePromise: EventLoopPromise<Void> = group.any().makePromise(of: Void.self)
+        let bootstrap = self.transportFactory
+            .makeBootstrap(connectTimeout: .seconds(5)) { channel in
                 if self.requireTls && self.tlsFirst {
                     upgradePromise.succeed(())
                     do {
@@ -764,8 +750,8 @@ final class ConnectionHandler: ChannelInboundHandler, Sendable {
                     }
                     return channel.eventLoop.makeSucceededFuture(())
                 }
-            }.connectTimeout(.seconds(5))
-        return (bootstrap, upgradePromise, attempt)
+            }
+        return (bootstrap, upgradePromise)
     }
 
     private func updateServersList(info: ServerInfo) {
